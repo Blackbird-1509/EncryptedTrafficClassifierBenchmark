@@ -8,6 +8,7 @@ Models:    xgb (flow statistics) | cnn1d | lstm | cnn_bigru_attn (main model) | 
 """
 import argparse
 import copy
+import json
 import os
 import time
 
@@ -232,8 +233,12 @@ def write_summary(rob, eff, out):
                      f"{s.macro_f1.mean():.4f} ± {s.groupby('seed').macro_f1.mean().std(ddof=0):.4f} | "
                      f"{e.params}{' trees' if v.startswith('xgb') else ''} | {e.latency_ms:.2f} |")
     text = "\n".join(lines)
-    open(os.path.join(out, "summary.md"), "w").write(text + "\n")
-    print("\n" + text)
+    with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    try:
+        print("\n" + text)
+    except UnicodeEncodeError:                      # exotic console code pages
+        print("\n" + text.replace("±", "+/-"))
 
 
 # --------------------------------------------------------------------------- main
@@ -251,7 +256,16 @@ def main():
                     help="flow: stratified by flow | group: whole pcap files held out (stricter)")
     ap.add_argument("--xgb-trials", type=int, default=8)
     ap.add_argument("--quick", action="store_true", help="3 epochs, 1 seed, no XGB tuning: pipeline check only")
+    ap.add_argument("--report-only", action="store_true",
+                    help="rebuild summary.md and robustness.png from the CSVs already in --out (no training)")
     args = ap.parse_args()
+    if args.report_only:
+        rob = pd.read_csv(os.path.join(args.out, "robustness.csv"))
+        eff = pd.read_csv(os.path.join(args.out, "efficiency.csv"))
+        write_summary(rob, eff, args.out)
+        make_plots(rob, None, [], args.out)         # confusion_matrix.png is left untouched
+        print(f"\nrebuilt summary.md and robustness.png in {args.out}/")
+        return
     if args.quick:
         args.epochs, args.seeds, args.xgb_trials = 3, 1, 1
 
@@ -261,6 +275,7 @@ def main():
 
     S, T, Y, G, classes = D.load(args.data)
     n_classes = len(classes)
+    json.dump(classes, open(os.path.join(args.out, "classes.json"), "w"))   # needed by predict.py
     tr, va, te = D.make_splits(Y, G, args.split)
     print(f"device={device} | {len(Y)} flows, {n_classes} classes | split={args.split}: "
           f"train {len(tr)} / val {len(va)} / test {len(te)}")
@@ -281,6 +296,7 @@ def main():
                 model = train_xgb(aug, seed, xgb_params, tr, va, S, T, Y, n_classes)
                 predict = lambda sets: model.predict(sets[1])
                 info = f"trees={model.best_iteration + 1}"
+                model.save_model(os.path.join(args.out, "ckpt", f"{variant}_seed{seed}.json"))
             else:
                 model, val_f1, ep = train_nn(base, aug, seed, tr, va, S, T, Y, n_classes, args, device)
                 predict = lambda sets: predict_nn(model, sets[0], device)

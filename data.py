@@ -38,17 +38,42 @@ def label_from_filename(path):
 
 
 # --------------------------------------------------------------------------- pcap parsing
-def pcap_to_flows(path, max_pkts=N_STORE, timeout=120.0, min_pkts=5, max_flows=None, seed=0):
-    """Parse one pcap/pcapng into bidirectional flows. Returns (sizes, ts) float32 arrays."""
-    from scapy.layers.inet import IP, TCP, UDP
-    from scapy.layers.inet6 import IPv6
-    from scapy.utils import PcapReader
-
+# Two packet readers feed one shared flow-assembly routine:
+#   _packets_fast  : dpkt reader + manual header parsing (~60x faster than Scapy; pcap and pcapng)
+#   _packets_scapy : fallback if dpkt is missing or a capture uses an unsupported link type
+# Both yield (time, ip_proto, src, sport, dst, dport, ip_size) for TCP/UDP packets only.
+def _assemble(packets, max_pkts, timeout, min_pkts):
     flows, finished = {}, []
 
     def finish(f):
         if len(f["sizes"]) >= min_pkts:
             finished.append(f)
+
+    for t, proto, src, sp, dst, dp, size in packets:
+        if sp in IGNORE_PORTS or dp in IGNORE_PORTS:
+            continue
+        a, b = (src, sp), (dst, dp)
+        key = (proto, a, b) if a <= b else (proto, b, a)
+        f = flows.get(key)
+        if f is not None and t - f["last"] > timeout:      # idle timeout -> new flow
+            finish(f)
+            f = None
+        if f is None:
+            f = flows[key] = {"init": a, "t0": t, "last": t, "sizes": [], "ts": []}
+        f["last"] = t
+        if len(f["sizes"]) < max_pkts:
+            sign = 1 if a == f["init"] else -1
+            f["sizes"].append(sign * max(1, min(size, 1500)))
+            f["ts"].append(t - f["t0"])
+    for f in flows.values():
+        finish(f)
+    return finished
+
+
+def _packets_scapy(path):
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.layers.inet6 import IPv6
+    from scapy.utils import PcapReader
 
     with PcapReader(path) as reader:
         for pkt in reader:
@@ -66,24 +91,79 @@ def pcap_to_flows(path, max_pkts=N_STORE, timeout=120.0, min_pkts=5, max_flows=N
                 sp, dp = pkt[UDP].sport, pkt[UDP].dport
             else:
                 continue
-            if sp in IGNORE_PORTS or dp in IGNORE_PORTS:
-                continue
-            t = float(pkt.time)
-            a, b = (src, sp), (dst, dp)
-            key = (proto,) + ((a, b) if a <= b else (b, a))
-            f = flows.get(key)
-            if f is not None and t - f["last"] > timeout:      # idle timeout -> new flow
-                finish(f)
-                f = None
-            if f is None:
-                f = flows[key] = {"init": a, "t0": t, "last": t, "sizes": [], "ts": []}
-            f["last"] = t
-            if len(f["sizes"]) < max_pkts:
-                sign = 1 if a == f["init"] else -1
-                f["sizes"].append(sign * max(1, min(size, 1500)))
-                f["ts"].append(t - f["t0"])
-    for f in flows.values():
-        finish(f)
+            yield float(pkt.time), proto, src, sp, dst, dp, size
+
+
+def _packets_fast(path):
+    import struct
+    import dpkt
+    H = struct.Struct(">H").unpack_from
+    HH = struct.Struct(">HH").unpack_from
+
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+        fh.seek(0)
+        reader = dpkt.pcapng.Reader(fh) if magic == b"\x0a\x0d\x0d\x0a" else dpkt.pcap.Reader(fh)
+        lt = reader.datalink()
+        if lt not in (1, 101, 113, 228, 229):
+            raise ValueError(f"unsupported link type {lt}")
+        try:
+            for ts, buf in reader:
+                if lt == 1:                                   # Ethernet (+ optional VLAN tags)
+                    off, et = 14, (buf[12] << 8) | buf[13] if len(buf) > 14 else 0
+                    while et in (0x8100, 0x88A8) and len(buf) >= off + 4:
+                        et = (buf[off + 2] << 8) | buf[off + 3]
+                        off += 4
+                elif lt == 113:                               # Linux cooked capture
+                    off, et = 16, (buf[14] << 8) | buf[15] if len(buf) > 16 else 0
+                else:                                         # raw IP
+                    if not buf:
+                        continue
+                    off, et = 0, (0x0800 if buf[0] >> 4 == 4 else 0x86DD)
+                if et == 0x0800:
+                    if len(buf) < off + 20 or H(buf, off + 6)[0] & 0x1FFF:    # short / non-first fragment
+                        continue
+                    proto = buf[off + 9]
+                    size = H(buf, off + 2)[0]
+                    src, dst = bytes(buf[off + 12:off + 16]), bytes(buf[off + 16:off + 20])
+                    l4 = off + (buf[off] & 0x0F) * 4
+                elif et == 0x86DD:
+                    if len(buf) < off + 40:
+                        continue
+                    proto = buf[off + 6]
+                    size = H(buf, off + 4)[0] + 40
+                    src, dst = bytes(buf[off + 8:off + 24]), bytes(buf[off + 24:off + 40])
+                    l4 = off + 40
+                else:
+                    continue
+                if (proto != 6 and proto != 17) or len(buf) < l4 + 4:
+                    continue
+                sp, dp = HH(buf, l4)
+                yield ts, proto, src, sp, dst, dp, size
+        except (dpkt.NeedData, struct.error):                 # truncated final record: keep what we have
+            return
+
+
+def pcap_to_flows(path, max_pkts=N_STORE, timeout=120.0, min_pkts=5, max_flows=None, seed=0,
+                  max_packets=None, parser="auto"):
+    """Parse one pcap/pcapng into bidirectional flows. Returns (sizes, ts) float32 arrays.
+    max_packets: stop reading the capture after this many TCP/UDP packets (None = read everything)."""
+    from itertools import islice
+
+    def run(gen):
+        return _assemble(islice(gen, max_packets) if max_packets else gen, max_pkts, timeout, min_pkts)
+
+    finished = None
+    if parser == "auto":
+        try:
+            import dpkt  # noqa: F401
+            finished = run(_packets_fast(path))
+        except ImportError:
+            pass
+        except ValueError as e:                                # e.g. unusual link type -> slow but general path
+            print(f"  note: {os.path.basename(path)}: {e}; falling back to Scapy")
+    if finished is None:
+        finished = run(_packets_scapy(path))
 
     if max_flows is not None and len(finished) > max_flows:
         idx = np.random.default_rng(seed).choice(len(finished), max_flows, replace=False)
@@ -98,17 +178,29 @@ def pcap_to_flows(path, max_pkts=N_STORE, timeout=120.0, min_pkts=5, max_flows=N
 
 
 def _worker(args):
-    path, max_flows = args
+    import time
+    path, max_flows, max_packets, cache_dir, parser = args
+    t0 = time.time()
+    cache = None
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache = os.path.join(cache_dir, f"{os.path.basename(path)}.{os.path.getsize(path)}.{max_flows}.{max_packets}.npz")
+        if os.path.exists(cache):
+            z = np.load(cache)
+            return path, (z["sizes"], z["ts"]), time.time() - t0, True
     try:
-        return path, pcap_to_flows(path, max_flows=max_flows)
+        res = pcap_to_flows(path, max_flows=max_flows, max_packets=max_packets, parser=parser)
     except Exception as e:  # corrupt / truncated capture
         print(f"  ! skipped {os.path.basename(path)}: {e}")
-        return path, None
+        return path, None, time.time() - t0, False
+    if cache:
+        np.savez_compressed(cache, sizes=res[0], ts=res[1])
+    return path, res, time.time() - t0, False
 
 
-def build_from_pcap_dir(root, workers=1, max_flows_per_file=None):
+def build_from_pcap_dir(root, workers=1, max_flows_per_file=None, max_packets=None, cache_dir=None, parser="auto"):
     import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     files = sorted(os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs
                    if f.lower().endswith((".pcap", ".pcapng")))
@@ -119,22 +211,35 @@ def build_from_pcap_dir(root, workers=1, max_flows_per_file=None):
     for p in unlabeled:
         print("   no label rule for:", os.path.basename(p))
 
-    jobs = [(p, max_flows_per_file) for p in todo]
+    # biggest files first, so the longest jobs start early and workers stay busy to the end
+    order = sorted(todo, key=os.path.getsize, reverse=True)
+    jobs = [(p, max_flows_per_file, max_packets, cache_dir, parser) for p in order]
+    results, done = {}, 0
+
+    def report(path, res, secs, cached):
+        nonlocal done
+        done += 1
+        n = 0 if res is None else len(res[0])
+        print(f"  [{done}/{len(todo)}] {os.path.basename(path):45s} {n:7d} flows -> {label_from_filename(path):13s}"
+              f" {secs:6.1f}s{'  (cached)' if cached else ''}", flush=True)
+        results[path] = res
+
     if workers > 1:
-        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as ex:  # same behaviour on Windows/Linux/macOS
-            results = list(ex.map(_worker, jobs))
+        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as ex:   # same on Windows/Linux/macOS
+            for fut in as_completed([ex.submit(_worker, j) for j in jobs]):
+                report(*fut.result())
     else:
-        results = [_worker(j) for j in jobs]
+        for j in jobs:
+            report(*_worker(j))
 
     S, T, Y, G = [], [], [], []
-    for gid, (p, res) in enumerate(results):
+    for gid, p in enumerate(todo):                       # group id = position in sorted file list (stable)
+        res = results.get(p)
         if res is None or len(res[0]) == 0:
             continue
-        s, t = res
-        S.append(s); T.append(t)
-        Y.append(np.full(len(s), CLASSES.index(label_from_filename(p))))
-        G.append(np.full(len(s), gid))
-        print(f"  {os.path.basename(p):45s} {len(s):7d} flows -> {label_from_filename(p)}")
+        S.append(res[0]); T.append(res[1])
+        Y.append(np.full(len(res[0]), CLASSES.index(label_from_filename(p))))
+        G.append(np.full(len(res[0]), gid))
     return np.concatenate(S), np.concatenate(T), np.concatenate(Y), np.concatenate(G)
 
 
