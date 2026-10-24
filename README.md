@@ -68,7 +68,7 @@ Each pcap is labelled from its **filename** using `LABEL_RULES` in `data.py` (fi
 Check the per-file lines printed in Step 1 and edit the rules if a capture lands in the wrong class. Classes with
 fewer than 30 flows are dropped automatically when `run.py` loads the data.
 
-## 4. Step 1: build the dataset
+## 4. Building the dataset
 
 ```bash
 python prepare_data.py --pcap-dir ISCXVPN2016 --out flows.npz --workers 8 --max-flows-per-file 5000 --cache-dir cache
@@ -97,7 +97,7 @@ Pipeline check without any data:
 python prepare_data.py --synthetic --out flows_synth.npz
 ```
 
-## 5. Step 2: train and evaluate
+## 5. Training and Evaluation
 
 ```bash
 python run.py --data flows.npz --out results --seeds 3
@@ -154,7 +154,8 @@ jitter (0-120 ms) and truncation (5-32 packets). Default set: `xgb`, `xgb+aug`, 
 
 Loss 20% and jitter 200 ms are outside the training augmentation range, so they test extrapolation.
 
-## 6. Step 3: test a single pcap
+## 6. Testing Models
+
 
 ```bash
 python predict.py --pcap test.pcap --results results --model cnn_bigru_attn+aug
